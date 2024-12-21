@@ -1,0 +1,1602 @@
+---
+title: "FinalProject"
+format: pdf
+editor: visual
+---
+
+# Data Programming with R
+
+### Dylan Forde
+
+### 24284209
+
+# Final Project
+
+## Part 1: Analysis
+
+##### 1.0 Untarring data set and loading libraries
+
+```{r}
+#| warning: false
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(kableExtra)
+
+untar("./lgg_tcga_pan_can_atlas_2018.tar.gz")
+
+```
+
+The data-set is the `Brain Lower Grade Glioma aggregated TCGA PanCancer Atlas` data. It can be downloaded from this link: <https://www.cbioportal.org/study/clinicalData?id=lgg_tcga_pan_can_atlas_2018>. There is a download button just next to the the title of the page. It comes with all of the clinical and genomic data for the study, in a tarred file. First we untar the file in our directory.
+
+##### 1.1 Reading In the Data
+
+```{r}
+
+
+data_patient_path <- "./lgg_tcga_pan_can_atlas_2018/data_clinical_patient.txt"
+data_patient_pre <- tryCatch({
+  read.delim(data_patient_path)
+}, error = function(e) {
+  stop("Error Reading File: ", e$message)
+})
+
+```
+
+Next, we read in the clinical patient data specifically, that is the file we will be using for our analysis in Part 1. It is a `.txt` file, so we use the `read.delim` function.
+
+##### 1.2 Initial Data Cleaning and Mutations
+
+```{r}
+#| warning: false
+
+# data cleaning initial
+# gets rid of na/pseudo-na values
+# changes those columns into friendlier names
+# selects useful columns
+data_patient <- data_patient_pre[5:dim(data_patient_pre)[1], ] %>%
+  as_tibble() %>%
+  filter(across(
+    c(
+      Subtype,
+      Overall.Survival.Status,
+      Progress.Free.Survival..Months.,
+      Genetic.Ancestry.Label,
+      Race.Category,
+      Radiation.Therapy
+    ),
+    ~ !. %in% c("", " ")
+  )) %>%
+  mutate(across(
+    c(
+      Diagnosis.Age,
+      Overall.Survival..Months.,
+      Progress.Free.Survival..Months.,
+    ),
+    as.numeric
+  )) %>%
+  mutate(
+    Diagnosis_Age = Diagnosis.Age,
+    Overall_Survival_Months = Overall.Survival..Months.,
+    Progress_Free_Survival_Months = Progress.Free.Survival..Months.,
+    Overall_Survival_Status = Overall.Survival.Status,
+    Genetic_Ancestry_Label = Genetic.Ancestry.Label,
+    Race_Category = Race.Category,
+    Radiation_Therapy = Radiation.Therapy,
+    Progression_Free_Status = Progression.Free.Status
+  ) %>%
+  select(
+    Subtype,
+    Overall_Survival_Status,
+    Progress_Free_Survival_Months,
+    Genetic_Ancestry_Label,
+    Race_Category,
+    Radiation_Therapy,
+    Diagnosis_Age,
+    Sex,
+    Overall_Survival_Months,
+    Progression_Free_Status
+  ) %>%
+  drop_na()
+
+str(data_patient, strict.width = "wrap")
+```
+
+The first few rows of our data set are meta information about the columns, there is a whole description of the data set within the untarred folder. We reduce the data set from the 5th row on to the full number of rows in the data set. We immediately cast this data set into the tibble type. To better use with dplyr and tidyverse packages. Next the goal is to see the structure of our data set.
+
+Next we identify a few columns we plan to use, for this we plan to definitely use columns like `Subtype`, `Overall.Survival.Status`, `Progress.Free.Survival..Months`, `Genetic.Ancestry.Label`, and `Race.Category`. We first dropped values that are considered NA already in our data set. However, as the columns selected are character columns, the values are recorded as empty strings over NA values. We filter out rows where blank data is present in these values. It does not matter now that columns that could be factors are kept as character, the most pressing are the numeric columns that were not originally numeric, therefore we cast those to numeric, but first we make sure that they are not blank values. Names are also changed for more structured form.
+
+##### 1.3 Ensuring Correct Casting and Removal of Blank Values
+
+```{r}
+
+data_patient_age <- data_patient %>%
+  select(Diagnosis_Age, Sex, Overall_Survival_Status)
+
+data_patient_age %>%
+  lapply(., function(x)
+    sum(is.na(x)))
+
+```
+
+We need to convert the data set to an easier form to calculate the age distributions, gender distributions across age, and gender distributions across age by health status. We need to convert the Age column from character to numeric, after doing that Idone at the start) we ensure there are no missing values found when doing this coercion. We check this for all of our other selected features just to be sure.
+
+##### 1.4 Distribution of Cases
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+ggplot(data = data_patient_age) +
+  geom_histogram(aes(x = Diagnosis_Age, fill = Sex), binwidth = 5) +
+  labs(x = "Age at Diagnosis",
+       y = "Number of Cases",
+       title = "Distribution of Cases by Age and Sex")
+
+```
+
+Ggplot2 is used to plot the cases of Lower Grade Brain Glioma by the age at patient diagnosis and the sex of the patient.
+
+##### 1.5 Distribution of Outcomes
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+ggplot(data = data_patient_age) +
+  geom_histogram(aes(x = Diagnosis_Age, fill = Sex), binwidth = 5) +
+  facet_grid(. ~ Overall_Survival_Status) +
+  labs(x = "Age at Diagnosis",
+       y = "Number of Cases",
+       title = "Distribution of Outcomes Across Age and Gender"
+       )
+
+```
+
+We split the data based on patient outcome, and look at the distribution between Age and Gender. It seems to be more common amongst males across all thresholds, however the distribution of outcomes matching deceased seems to be balanced more by gender. Leading to the visual hypothesis that it is more dangerous for Female Patients.
+
+After forming the hypothesis that Lower Grade Brain Glioma is more dangerous for female Patients, we will do some initial survival analysis for each sub-type of LGG.
+
+##### 1.6 Survival Probability Function
+
+```{r}
+calculate_survival_prob <- function(data, group_var) {
+  data %>%
+    group_by(!!sym(group_var)) %>%
+    arrange(time) %>%
+    mutate(
+      n_risk = n() - cumsum(status),
+      n_events = cumsum(status),
+      surv_prob = cumprod(1 - (status / n_risk))
+    )
+}
+
+
+data_survival <- data_patient %>%
+  mutate(
+    status = as.numeric(substr(Overall_Survival_Status, 1 , 1)),
+    time = as.numeric(Overall_Survival_Months),
+    subtype = factor(Subtype),
+    sex = factor(Sex),
+    race = factor(Genetic_Ancestry_Label),
+    age_group = cut(
+      Diagnosis_Age,
+      breaks = c(0, 30, 50, 70, Inf),
+      labels = c("0-30", "31-50", "51-70", "70+")
+    )
+  )
+```
+
+We want to calculate the survival properties based on groups that we are adding to the data_survival data set. We make the function here so that we can call it without having to repeat the code we have generated already.
+
+##### 1.7 Survival Probabilities by Sub type
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+survival_probabilities <- calculate_survival_prob(data_survival, "Subtype")
+
+ggplot(survival_probabilities,
+       aes(x = time, y = surv_prob, color = subtype)) +
+  geom_step() +
+  geom_point(aes(shape = as.factor(status))) +
+  labs(
+    x = "Time in Months",
+    y = "Overall Survival Probability",
+    title = "Survival Analysis by Subtype",
+    color = "Subtype",
+    shape = "Status"
+  )
+```
+
+The `LGG_IDHwt` is not unexpected to see with the lowest survival rate. This is due to the fact it is IDH Wild Type. These tumors are more likely to display tendencies like high-grade gliomas. `LGG_IDHmut-codel` is the highest survival likelihood. The tumor cells have a mutation in the IDH gene as well as a simultaneous deletion of a chromosomal arm. Typically oligodendrogliomas, which are associated with more favorable responses. The `LGG_mut-non-codel`, does not have as favorable an outlook. These tumors are typically astrocytomas, and generally an intermediate prognosis. The ordered of the sub types survival times is within expectations.
+
+##### 1.8 Survival Probabilities by Sex
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+survival_probabilities <- calculate_survival_prob(data_survival, "Sex")
+
+ggplot(survival_probabilities,
+       aes(x = time, y = surv_prob, color=sex)) +
+  geom_step() +
+  geom_point(aes(shape=as.factor(status))) +
+  labs(
+    x = "Time in Months",
+    y = "Overall Survival Probability",
+    title = "Survival Analysis by Gender",
+    color = "Gender",
+    shape = "Status"
+  )
+```
+
+As you can see here, it does indeed seem like there are more males among the patient population, however among the patient outcomes there is a disproportionate number of women. This can be verified through the lower patient survival probability in the graph.
+
+##### 1.9 Survival Probabilities by Sub type and Sex
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+ggplot(survival_probabilities, aes(x = time, y = surv_prob, color = sex)) +
+  geom_step() +
+  geom_point(aes(shape = as.factor(status))) +
+  labs(
+    x = "Time in Months",
+    y = "Overall Survival Probability",
+    title = "Survival Analysis by Subtype and Gender",
+    color = "Gender",
+    shape = "Status"
+  ) +
+  facet_grid(. ~ Subtype)
+
+```
+
+To look at the sub types of cancer more carefully based on this, we can say the reason there is a lower female survival probability is likely not due to differences in sub types. There are very few additional cases of the wild type for female patients. Maybe we should forget about this for the moment.
+
+##### 1.10 Sub type Demographics
+
+```{r}
+
+subtype_demographics <- data_patient %>%
+  group_by(Subtype) %>%
+  summarize(
+    n_patients = n(),
+    avg_age = mean(Diagnosis_Age, na.rm = TRUE),
+    pct_female = mean(Sex == "Female", na.rm = TRUE) * 100,
+    median_survival = median(Overall_Survival_Months, na.rm = TRUE)
+  )
+
+kable(subtype_demographics) %>%
+  kable_classic()
+```
+
+The non-co-deletion LGG has the highest number of patients. This is the intermediate risk sub type, the co-deletion LGG IDH is the middle number of patients, with the best prognosis. It is very odd to see that it has a lower median survival in months, when it is accepted to be the lowest risk form of LGG. I'm thinking this can be due to the higher average age which can be seen from the table, leading to this hypothesis.
+
+##### 1.11 Ancestry Distribution
+
+```{r}
+
+ancestry_dist <- data_patient %>%
+  count(Genetic_Ancestry_Label, Subtype) %>%
+  group_by(Genetic_Ancestry_Label) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+ancestry_dist <- ancestry_dist %>%
+  mutate(Ancestry = Genetic_Ancestry_Label,
+         Number_of_Cases = n,
+         Percentage = percentage) %>%
+  select(-c(Genetic_Ancestry_Label, n, percentage))
+
+kable(ancestry_dist) %>%
+  kable_classic()
+
+```
+
+We are able to see the distribution of sub types by race, along with the number of cases and a percentage of the overall race in that sub type. We can see that the vast majority of our data studies patients of European ancestry. Potentially skewing our models for the other races.
+
+##### 1.12 Survival Analysis by Race
+
+```{r}
+#| fig-height: 8
+#| fig-width: 8
+
+survival_probabilities <- calculate_survival_prob(data_survival, "race")
+
+ggplot(survival_probabilities, aes(x = time, y = surv_prob, color = race)) +
+  geom_step() +
+  geom_point(aes(shape = as.factor(status))) +
+  labs(
+    x = "Time in Months",
+    y = "Overall Survival Probability",
+    title = "Survival Analysis by Race",
+    color = "Race",
+    shape = "Status"
+  )
+```
+
+We can see from the data how our data for European ancestry is much more reliable and smooth when compared to the unreliable and low number of instances of other races.
+
+##### 1.13 Table of Race Outcomes
+
+```{r}
+
+race_outcomes <- data_patient %>%
+  group_by(Genetic_Ancestry_Label) %>%
+  summarize(
+    n_patients = n(),
+    median_survival = median(Overall_Survival_Months, na.rm = TRUE),
+    progression_rate = mean(Progression_Free_Status == "1:PROGRESSION",
+                            na.rm = TRUE) * 100
+  )
+
+kable(race_outcomes) %>%
+  kable_classic()
+```
+
+Here we can see the data for median survival length in Months, as well as the percent of patients for each racial group that had tumor progression. For example, of the 5 east asian patients, none progressed further according to the data. It is worth investigating to ensure that there is no incorrect entries, as the median survival is lower than you would expect for no progression.
+
+##### 1.14 Comparison of Overall Survival and Progression Timelines
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+ggplot(data_patient, aes(
+  x = round(Overall_Survival_Months, 1),
+  y = round(Progress_Free_Survival_Months
+            , 1)
+)) +
+  geom_point(aes(color = Subtype)) +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(x = "Overall Survival in Months",
+       y = "Progression Free Survival in Months",
+       title = "Disease Progression timeline")
+         
+```
+
+Here we can get a general overview of the overall length of survival in months for each case, colored by its sub type. We compare this against a slope of 1 and find a surprisingly low number of cases above the trend line, however when thinking about it it is not surprising. We are able to see the concentration of the highest progression sub-type clustered around the origin. For values above the slope it is likely some data entry error, or possibly a mortician discovered tumor progression and it was reported after the patient was already passed away.
+
+##### 1.15 Table of Treatment Patterns
+
+```{r}
+
+treatment_patterns <- data_patient %>%
+  group_by(Subtype) %>%
+  summarize(
+    received_radiation = mean(Radiation_Therapy == "Yes", na.rm = TRUE) * 100,
+    progression_rate = mean(Progression_Free_Status == "1:PROGRESSION",
+                            na.rm = TRUE) * 100
+  )
+
+kable(treatment_patterns) %>%
+  kable_classic()
+```
+
+From this it would be fair to say that radiation therapy actually makes patients have a higher progression rate, but we must remember it is already determined that this sub-type is the most dangerous and more susceptible to progression as a baseline. It is still staggering to see the more than double rate compared to the intermediate danger sub-type.
+
+##### 1.16 Survival Analysis by Age Group
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+survival_probabilities <- calculate_survival_prob(data_survival, "age_group")
+
+ggplot(survival_probabilities,
+       aes(
+         x = time,
+         y = surv_prob,
+         color = as.factor(age_group)
+       )) +
+  geom_step() +
+  geom_point(aes(shape = as.factor(status))) +
+  labs(
+    x = "Time in Months",
+    y = "Overall Survival Probability",
+    title = "Overall Survival Time by Age Group",
+    color = "Age Group",
+    shape = "Status"
+  )
+
+```
+
+Some age groups fair better than others in terms of likelihood of survival. It is fair to say that the younger patients are more likely to have more robust bodies which can keep up better with the negative effects of cancer as well as the side effects of radiation therapy.
+
+##### 1.17 Treatment Group Effectiveness by Subtype
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+ggplot(data_patient,
+       aes(x = Progress_Free_Survival_Months, fill = Radiation_Therapy)) +
+  geom_density(alpha = 0.5) +
+  facet_grid(. ~ Subtype) +
+  labs(x = "Time in Months",
+       y = "Overall Survival Time",
+       title = "Treatment Group Effectiveness by Subtype",
+       fill = "Radiation Therapy")
+```
+
+As is known, radiation therapy does have some beneficial aspect, however the negative aspects of the therapy and its side effects make only a somewhat positive difference.
+
+##### 1.18 Progression Vs. Overall Survival by Subtype
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+# Create progression timeline visualization
+data_patient %>%
+  select(Subtype,
+         Progress_Free_Survival_Months,
+         Overall_Survival_Months) %>%
+  pivot_longer(
+    cols = c(Progress_Free_Survival_Months, Overall_Survival_Months),
+    names_to = "survival_type",
+    values_to = "months"
+  ) %>%
+  ggplot(aes(x = months, fill = survival_type)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap( ~ Subtype) +
+  labs(title = "Progression vs Overall Survival by Subtype",
+       x = "Time in Months",
+       y = "Survival",
+       fill = "Survival Type")
+
+```
+
+We can see here again the dramatic LGG_IDHwt progression rate when compared to the other sub types. The intermediate risk group look to have similarity between the lowest risk group.
+
+##### 1.19 Comprehensive Stats
+
+```{r}
+
+comprehensive_stats <- data_patient %>%
+  group_by(Subtype) %>%
+  summarize(
+    total_cases = n(),
+    median_age = median(Diagnosis_Age, na.rm=TRUE),
+    male_percent = mean(Sex == "Male", na.rm = TRUE) * 100,
+    progression_rate = mean(Progression_Free_Status == "1:PROGRESSION",
+                            na.rm = TRUE) * 100,
+    median_survival = median(Overall_Survival_Months, na.rm= TRUE)
+  )
+
+kable(comprehensive_stats %>% select(-c(male_percent))) %>%
+  kable_classic()
+```
+
+We can see the most dangerous sub-type has a much higher median age. What is most surprising is that the median age for the lowest risk subgroup is actually older than the median age of the intermediate risk sub group. You can see that the progression rate is higher on the intermediate subgroup, however there is a longer average survival time. Overall an average survival length of 5 months longer is not advantageous for a lower median age by about nine years.
+
+##### 1.20 Disease Progression by Subtype
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+# Disease progression stacked bar chart
+data_patient %>%
+  group_by(Subtype, Progression_Free_Status) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count)) %>%
+  ggplot(aes(x = Subtype, y = prop, fill = Progression_Free_Status)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Disease Progression Proportions by Subtype")
+```
+
+Just to verify after seeing the previous data, it is clear to see that the youngest age subgroup actually have a higher likelihood of progression. This goes against my initial assumptions, I had said earlier that younger age groups faired better on the survival analysis, however here it seems to be more likely that they progress and they only have a mediocre lead in survival time. I wonder if the study ended before their survival times could be properly guaged. It is possible that there was lower or higher progression rates after the end of the study. We would need to know more about the collection and study that was done in order to answer these questions.
+
+##### 1.21 Treatment Effectiveness by Subtype
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+# Treatment effectiveness boxplot
+ggplot(
+  data_patient,
+  aes(x = Radiation_Therapy,
+      y = Progress_Free_Survival_Months,
+      fill = Subtype)
+) +
+  geom_boxplot() +
+  labs(title = "Treatment Effectiveness by Subtype",
+       x = "Radiation Therapy",
+       y = "Progress Free Survival Months")
+```
+
+Taller bars are better here, it seems that within expectations the youngest median subgroup, with the intermediate risk, found the biggest increase in survival times due to radiation therapy.The other groups have marginal differences between the two therapies.
+
+##### 1.22 Rapid Progression vs Non-Rapid Progression
+
+```{r}
+
+# Rapid Progression
+data_patient %>%
+  mutate(
+    survival_months = Overall_Survival_Months,
+    progression_months = Progress_Free_Survival_Months,
+    rapid_progression = progression_months < median(progression_months,
+                                                    na.rm = TRUE)
+  ) %>%
+  group_by(Subtype, rapid_progression) %>%
+  summarise(
+    count = n(),
+    avg_survival = mean(survival_months, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  kable() %>%
+  kable_classic()
+```
+
+When we break this down by choosing to subset between two groups, one where they are above the median and one where they are below the median, our expectations better match what one would expect based on the background information and information uncovered in the EDA. Looking back to our original histogram of age split by outcome, there is a disproportionate number of older age people who die, therefore skewing medians. It is likely that the largest portion of low risk deaths come from older age individuals, and this will hold for all subgroups. Also another possibility is that there seems to be no data for someone under 25 to have a negative outcome, when there are diagnosed patients in that age bracket. There might be some regulations around reporting deaths of people under a certain age. In the USA people come off of parents health insurance plans at age 26, maybe this plays some factor.
+
+This is further continued in part 3, where we calculate survival metrics using developed S3 methods using our survival data.
+
+## Part 2: R Package
+
+For the R package we will be choosing is rvest, which is a web scraping package. I decided to use this one after seeing someone say it is one of their favorite packages on Reddit when googling best R packages. I have never scraped from the web before so it seemed a fair one to try. I did not see it mentioned in any lectures.
+
+##### 2.0 Loading R packages
+
+```{r}
+#| warning: false
+
+
+library(rvest)
+library(purrr)
+library(stringr)
+```
+
+##### 2.1 Read_HTML Function
+
+The `read_html` function is used to download and parse HTML from a URL. We can use it to access the wiki page for Lagrange polynomials.
+
+```{r}
+url <- "https://en.wikipedia.org/wiki/Lagrange_polynomial"
+page <- read_html(url)
+
+str(page)
+```
+
+##### 2.2 Html_Elements Function
+
+The `html_elements` function allows the user to select specific elements from the HTML using CSS selectors. We use it to extract all the math formulas form the Wikipedia page.
+
+```{r}
+
+
+# Extract all math elements
+math_elements <- page %>%
+  html_elements(".mwe-math-element")
+
+# Print the number of mathematical elements found
+cat("Number of mathematical elements found:",
+    length(math_elements),
+    "\n")
+
+# Extract the first three formulas
+first_three_formulas <- math_elements[1:3] %>%
+  html_text()
+
+# Display the formulas
+cat("\nFirst three mathematical formulas:\n")
+for (i in seq_along(first_three_formulas)) {
+  cat(sprintf("Formula %d: %s\n", i, first_three_formulas[i]))
+}
+```
+
+##### 2.3 Html_Text Function
+
+The `html_text` function extracts the text content from HTML elements. We use it to get the main content of the wiki page article.
+
+```{r}
+main_content <- page %>%
+  html_elements(".mw-parser-output > p") %>%
+  html_text() %>%
+  .[nchar(.) > 50]
+
+cat("First Paragraph Content:\n", strwrap(main_content[1]))
+cat("\nNumber of Paragraphs:", length(main_content))
+cat("\nAverage paragraph length", mean(nchar(main_content)))
+```
+
+##### 2.4 Further Use of Functions
+
+Using the returned object to view some of the article data, ensure it is working correctly.
+
+```{r}
+
+# Create a summary dataframe
+article_summary <- tibble(
+  title = page %>%
+    html_element("h1") %>%
+    html_text(),
+  intro_paragraph = main_content[1],
+  num_formulas = length(math_elements),
+  references = page %>%
+    html_elements(".reference-text") %>%
+    length()
+)
+
+
+# Display the summary
+kable(article_summary %>% select(-c(intro_paragraph))) %>%
+  kable_classic()
+```
+
+Creating a structured data set using the scraped content. We skip the intro paragraph in the table, as it would be a bit too much to fit onto the table.
+
+```{r}
+# Function to safely read URLs
+safe_read_html <- function(url, max_retries = 3) {
+  attempt <- 1
+  while (attempt <= max_retries) {
+    tryCatch({
+      return(read_html(url))
+    }, error = function(e) {
+      if (attempt == max_retries) {
+        stop(sprintf(
+          "Failed to read URL after %d attempts: %s",
+          max_retries,
+          e$message
+        ))
+      }
+      cat(sprintf("Attempt %d failed, retrying ", attempt))
+      Sys.sleep(1)
+      attempt <<- attempt + 1
+    })
+  }
+}
+
+url <- "https://en.wikipedia.org/wiki/Lagrange_polynomial"
+page <- safe_read_html(url)
+
+```
+
+We are able to improve the base function with some error handling in order to prevent calling to the page too many times when you might be disconnected from the internet or some connectivity problem has occured.
+
+```{r}
+
+# Extract all mathematical content with context
+math_content <- page %>%
+  html_elements(".mwe-math-element") %>%
+  map_df(function(element) {
+    # Get the formula
+    formula <- element %>% html_text()
+    
+    # Get surrounding paragraph
+    context <- element %>%
+      html_element(xpath = "./ancestor::p") %>%
+      html_text()
+    
+    # Create a data frame row
+    tibble(
+      formula = formula,
+      context = context,
+      has_equation = str_detect(formula, "="),
+      length = nchar(formula)
+    )
+  })
+
+# Analyze the mathematical content
+math_summary <- math_content %>%
+  summarise(
+    total_formulas = n(),
+    equations = sum(has_equation),
+    avg_length = mean(length),
+    max_length = max(length)
+  )
+
+print(math_summary)
+
+```
+
+The package is built with dplyr in mind, and follows a structure that people would be familiar with using.
+
+```{r}
+
+
+# Extract any tables from the page
+tables <- page %>%
+  html_elements("table.wikitable") %>%
+  html_table()
+
+# Process tables if they exist
+if (length(tables) > 0) {
+  first_table <- tables[[1]] %>%
+    as_tibble() %>%
+    # Clean column names
+    rename_all( ~ str_to_lower(str_replace_all(., "\\s+", "_")))
+  
+  print(first_table)
+} else {
+  cat("No tables found in the article")
+}
+```
+
+We can check to see if things like tables are on the site, it requires a bit more html knowledge than I have, but I believe this is checking it correctly.
+
+```{r}
+# Extract and analyze references
+references <- page %>%
+  html_elements(".reference-text") %>%
+  map_df(function(ref) {
+    # Extract reference text
+    ref_text <- ref %>% html_text()
+    
+    # Determine reference type
+    ref_type <- case_when(
+      str_detect(ref_text, "(?i)journal|paper") ~ "Journal",
+      str_detect(ref_text, "(?i)book") ~ "Book",
+      str_detect(ref_text, "(?i)web|http") ~ "Website",
+      TRUE ~ "Other"
+    )
+    
+    tibble(
+      text = ref_text,
+      type = ref_type,
+      year = str_extract(ref_text, "\\b19\\d{2}|20\\d{2}\\b"),
+      has_doi = str_detect(ref_text, "doi"),
+      length = nchar(ref_text)
+    )
+  })
+
+# Summarize references
+ref_summary <- references %>%
+  group_by(type) %>%
+  summarise(
+    count = n(),
+    avg_length = mean(length),
+    doi_count = sum(has_doi, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+print(ref_summary)
+```
+
+We are able to do analysis on the scraped data such as using the html_elements function previously described to extract the references section data and use this to analyse the reference articles.
+
+```{r}
+# Function to implement polite scraping
+scrape_with_delay <- function(urls, delay = 2) {
+  map(urls, function(url) {
+    Sys.sleep(delay)  # Wait between requests
+    safe_read_html(url)
+  })
+}
+```
+
+This will prevent any misuse where you might accidentally send too many requests to a site that cannot handle the number of requests.
+
+```{r}
+# Function to verify selector validity
+check_selector <- function(page, selector) {
+  elements <- html_elements(page, selector)
+  cat(sprintf(
+    "Selector '%s' found %d elements\n",
+    selector,
+    length(elements)
+  ))
+  return(length(elements) > 0)
+}
+```
+
+In order to check that you have your html tags correct you can query the html_elements with a second parameter for selector. Allowing you to faster check if you have html element names correct.
+
+## Part 3: Functions/Programming
+
+```{r}
+
+str(data_survival, strict.width="wrap")
+
+```
+
+The goal will be to create S3 methods that work with the data we had earlier to give us information and plots that we otherwise had to calculate. I will try not to use any other libraries for these functions so they are not dependent on other package versions.
+
+```{r}
+
+#' Complete implementation of custom survival analysis with S3 methods
+#' @author Dylan Forde
+#' @description A custom implementation of survival analysis without
+#' external packages
+
+#' Base computation function for Kaplan-Meier estimates
+#' @param times Vector of survival times
+#' @param status Vector of status indicators (0=censored, 1=event)
+#' @return List containing survival probabilities and related statistics
+
+kaplan_meier <- function(times, status) {
+  ord <- order(times)
+  times <- times[ord]
+  status <- status[ord]
+  
+  unique_times <- sort(unique(times[status == 1]))
+  
+  n_risk <- numeric(length(unique_times))
+  n_events <- numeric(length(unique_times))
+  n_censored <- numeric(length(unique_times))
+  
+  for (i in seq_along(unique_times)) {
+    time_i <- unique_times[i]
+    at_risk <- times >= time_i
+    n_risk[i] <- sum(at_risk)
+    n_events[i] <- sum(status[times == time_i] == 1)
+    n_censored[i] <- sum(status[times == time_i] == 0)
+  }
+  
+  surv_prob <- numeric(length(unique_times))
+  surv_prob[1] <- (n_risk[1] - n_events[1]) / n_risk[1]
+  if (length(unique_times) > 1) {
+    for (i in 2:length(unique_times)) {
+      surv_prob[i] <- surv_prob[i - 1] * (n_risk[i] - n_events[i]) / n_risk[i]
+    }
+  }
+  
+  var_log <- numeric(length(unique_times))
+  for (i in seq_along(unique_times)) {
+    var_log[i] <- sum(n_events[1:i] / (n_risk[1:i] * (n_risk[1:i] -
+                                                        n_events[1:i])))
+  }
+  
+  se <- sqrt(var_log)
+  ci_upper <- exp(log(surv_prob) + 1.96 * se)
+  ci_lower <- exp(log(surv_prob) - 1.96 * se)
+  
+  ci_upper <- pmin(ci_upper, 1)
+  ci_lower <- pmax(ci_lower, 0)
+  
+  return(
+    list(
+      time = unique_times,
+      survival = surv_prob,
+      n_risk = n_risk,
+      n_events = n_events,
+      n_censored = n_censored,
+      upper = ci_upper,
+      lower = ci_lower
+    )
+  )
+}
+
+#' Base computation function for log-rank test
+#' @param times Vector of survival times
+#' @param status Vector of status indicators
+#' @param group Vector of group indicators
+#' @return List containing test statistics and related values
+log_rank_test <- function(times, status, group) {
+  groups <- unique(group)
+  n_groups <- length(groups)
+  
+  ord <- order(times)
+  times <- times[ord]
+  status <- status[ord]
+  group <- group[ord]
+  
+  event_times <- sort(unique(times[status == 1]))
+  
+  observed <- matrix(0, nrow = length(event_times), ncol = n_groups)
+  expected <- matrix(0, nrow = length(event_times), ncol = n_groups)
+  
+  for (i in seq_along(event_times)) {
+    time_i <- event_times[i]
+    at_risk <- times >= time_i
+    
+    for (j in 1:n_groups) {
+      observed[i, j] <- sum(times == time_i &
+                              status == 1 & group == groups[j])
+      
+      n_risk <- sum(at_risk)
+      n_risk_group <- sum(at_risk & group == groups[j])
+      n_events <- sum(times == time_i & status == 1)
+      
+      expected[i, j] <- n_events * n_risk_group / n_risk
+    }
+  }
+  
+  O_E <- colSums(observed - expected)
+  V <- matrix(0, n_groups, n_groups)
+  
+  for (i in seq_along(event_times)) {
+    n_risk <- sum(times >= event_times[i])
+    n_events <- sum(times == event_times[i] & status == 1)
+    if (n_risk > 1) {
+      risk_props <- sapply(groups, function(g)
+        sum(times >= event_times[i] & group == g)) / n_risk
+      V_i <- n_events * (n_risk - n_events) / (n_risk - 1) *
+        outer(risk_props, risk_props)
+      diag(V_i) <- risk_props * (1 - risk_props) *
+        n_events * (n_risk - n_events) / (n_risk - 1)
+      V <- V + V_i
+    }
+  }
+  
+  df <- n_groups - 1
+  chi_sq <- t(O_E[-1]) %*% solve(V[-1, -1]) %*% O_E[-1]
+  p_value <- 1 - pchisq(chi_sq, df = df)
+  
+  return(
+    list(
+      chi_square = as.numeric(chi_sq),
+      df = df,
+      p_value = as.numeric(p_value),
+      observed = colSums(observed),
+      expected = colSums(expected)
+    )
+  )
+}
+
+#' Base computation function for hazard rate
+#' @param times Vector of survival times
+#' @param status Vector of status indicators
+#' @return List containing hazard rates and times
+hazard_rate <- function(times, status) {
+  km <- kaplan_meier(times, status)
+  hazard <- km$n_events / km$n_risk
+  
+  return(list(time = km$time, hazard = hazard))
+}
+
+#' Generic function for hazard calculation
+#' @param x Object to calculate hazard from
+#' @param ... Additional arguments
+#' @export
+hazard <- function(x, ...) {
+  UseMethod("hazard")
+}
+
+#' Generic function for restricted mean survival time
+#' @param x Object to calculate RMST from
+#' @param ... Additional arguments
+#' @export
+rmst <- function(x, ...) {
+  UseMethod("rmst")
+}
+
+#' Constructor function for custom survival analysis
+#' @param data Data frame containing survival data
+#' @param time_col Name of time column
+#' @param status_col Name of status column
+#' @param group_col Optional grouping column
+#' @return Object of class "custom_survival"
+#' @export
+custom_survival_analyzer <- function(data,
+                                     time_col,
+                                     status_col,
+                                     group_col = NULL)
+  {
+  if (!all(c(time_col, status_col) %in% names(data))) {
+    stop("Time or status column not found in data")
+  }
+  
+  obj <- structure(
+    list(
+      data = data,
+      time_col = time_col,
+      status_col = status_col,
+      group_col = group_col,
+      fit = NULL,
+      groups = NULL
+    ),
+    class = "custom_survival"
+  )
+  
+  obj <- fit.custom_survival(obj)
+  return(obj)
+}
+
+#' S3 method for fitting custom survival object
+#' @param object custom_survival object
+#' @return Fitted custom_survival object
+#' @export
+fit.custom_survival <- function(object) {
+  times <- object$data[[object$time_col]]
+  status <- object$data[[object$status_col]]
+  
+  if (is.null(object$group_col)) {
+    km_results <- kaplan_meier(times, status)
+    lr_test <- NULL
+    groups <- NULL
+  } else {
+    if (!object$group_col %in% names(object$data))
+      stop("Group column not found in data")
+    groups <- unique(object$data[[object$group_col]])
+    
+    km_results <- lapply(groups, function(g) {
+      idx <- object$data[[object$group_col]] == g
+      kaplan_meier(times[idx], status[idx])
+    })
+    names(km_results) <- groups
+    
+    lr_test <- log_rank_test(times, status, object$data[[object$group_col]])
+  }
+  
+  object$fit <- list(km_results = km_results, lr_test = lr_test)
+  object$groups <- groups
+  
+  return(object)
+}
+
+#' S3 method for calculating hazard from custom survival object
+#' @param x custom_survival object
+#' @param ... Additional arguments
+#' @return Object of class "hazard.custom_survival"
+#' @export
+hazard.custom_survival <- function(x, ...) {
+  if (is.null(x$groups)) {
+    # For non-grouped data
+    result <- hazard_rate(x$data[[x$time_col]], x$data[[x$status_col]])
+    structure(list(overall = result), class = "hazard.custom_survival")
+  } else {
+    # For grouped data
+    result <- lapply(x$groups, function(g) {
+      idx <- x$data[[x$group_col]] == g
+      hazard_rate(x$data[[x$time_col]][idx], x$data[[x$status_col]][idx])
+    })
+    names(result) <- x$groups
+    structure(result, class = "hazard.custom_survival")
+  }
+}
+
+#' S3 method for calculating RMST from custom survival object
+#' @param x custom_survival object
+#' @param tau Optional time horizon
+#' @param ... Additional arguments
+#' @return Object of class "rmst.custom_survival"
+#' @export
+rmst.custom_survival <- function(x, tau = NULL, ...) {
+  if (is.null(x$groups)) {
+    # Single group case
+    result <- rmst_calc(x$fit$km_results, tau)
+    names(result) <- "overall"
+  } else {
+    # Multiple groups case
+    result <- numeric(length(x$groups))
+    for (i in seq_along(x$groups)) {
+      result[i] <- rmst_calc(x$fit$km_results[[i]], tau)
+    }
+    names(result) <- x$groups
+  }
+  
+  structure(result, class = "rmst.custom_survival")
+}
+
+#' Helper function for RMST calculation
+#' @param km Kaplan-Meier estimate object
+#' @param tau Time horizon
+#' @return Numeric RMST value
+rmst_calc <- function(km, tau = NULL) {
+  if (is.null(tau))
+    tau <- max(km$time)
+  
+  # Create sequence of times including 0 and all observed times up to tau
+  times <- c(0, km$time[km$time <= tau])
+  surv <- c(1, km$survival[km$time <= tau])
+  
+  # Add tau if it's not included
+  if (tail(times, 1) < tau) {
+    times <- c(times, tau)
+    surv <- c(surv, tail(surv, 1))
+  }
+  
+  # Calculate area using trapezoidal rule
+  area <- 0
+  for (i in 2:length(times)) {
+    area <- area + (times[i] - times[i - 1]) * (surv[i] + surv[i - 1]) / 2
+  }
+  
+  return(area)
+}
+
+#' S3 print method for hazard.custom_survival objects
+#' @param x hazard.custom_survival object
+#' @param ... Additional arguments
+#' @export
+print.hazard.custom_survival <- function(x, ...) {
+  cat("Hazard Rate Analysis (at quartiles)\n")
+  cat("---------------------------------\n")
+  
+  for (group in names(x)) {
+    cat("\nGroup:", group, "\n")
+    # Calculate quartile positions
+    times <- x[[group]]$time
+    hazards <- x[[group]]$hazard
+    q_pos <- floor(quantile(1:length(times),
+                            probs = c(0, 0.25, 0.5, 0.75, 1))
+                   )
+    
+    # Create summary dataframe
+    quartile_summary <- data.frame(
+      Time = times[q_pos],
+      Hazard = round(hazards[q_pos], 4),
+      Quartile = c("Min", "Q1", "Median", "Q3", "Max")
+    )
+    
+    print(quartile_summary)
+  }
+}
+
+
+#' Print method for rmst.custom_survival objects
+#' @param x rmst.custom_survival object
+#' @param ... Additional arguments
+#' @export
+print.rmst.custom_survival <- function(x, ...) {
+  cat("Restricted Mean Survival Time\n")
+  cat("--------------------------\n")
+  if (length(x) > 1) {
+    cat("\nBy group:\n")
+    print(data.frame(
+      Group = names(x),
+      RMST = round(unname(x), 2),
+      row.names = NULL
+    ))
+  } else {
+    cat("\nOverall RMST:", round(x, 2), "months\n")
+  }
+}
+
+#' S3 print method for custom_survival objects
+#' @param x custom_survival object
+#' @param ... Additional arguments
+#' @export
+print.custom_survival <- function(x, ...) {
+  cat("Custom Survival Analysis\n")
+  cat("-----------------------\n")
+  cat("Sample size:", nrow(x$data), "\n")
+  cat("Total follow-up time:", sum(x$data[[x$time_col]]), "months\n")
+  
+  total_events <- sum(x$data[[x$status_col]])
+  total_censored <- sum(x$data[[x$status_col]] == 0)
+  
+  cat("Number of events:", total_events, "\n")
+  cat("Censoring rate:",
+      round(total_censored/nrow(x$data) * 100, 1),
+      "%\n"
+      )
+  
+  if (!is.null(x$group_col)) {
+    cat("\nGroup Summary:\n")
+    group_table <- table(x$data[[x$group_col]])
+    
+    group_events <- tapply(x$data[[x$status_col]],
+                           x$data[[x$group_col]], 
+                           sum)
+    
+    group_summary <- data.frame(
+      N = as.vector(group_table),
+      Events = as.vector(group_events),
+      "Censoring %" = round((1 - group_events / group_table) * 100, 1)
+    )
+    print(group_summary)
+  }
+}
+
+#' S3 summary method for custom_survival objects
+#' @param object custom_survival object
+#' @param ... Additional arguments
+#' @return Object of class "summary.custom_survival"
+#' @export
+summary.custom_survival <- function(object, ...) {
+  get_metrics <- function(km, group_data = NULL, status_col = NULL) {
+    median <- which(km$survival <= 0.5)[1]
+    median <- if (is.na(median))
+      NA
+    else
+      km$time[median]
+    
+    rmst_val <- rmst_calc(km)
+    
+    if (!is.null(group_data) && !is.null(status_col)) {
+      # Group-specific events and censoring
+      total_events <- sum(group_data[[status_col]])
+      total_censored <- sum(group_data[[status_col]] == 0)
+    } else {
+      # Overall events and censoring
+      total_events <- sum(object$data[[object$status_col]])
+      total_censored <- sum(object$data[[object$status_col]] == 0)
+    }
+    
+    c(
+      median = median,
+      rmst = rmst_val,
+      events = total_events,
+      censored = total_censored
+    )
+  }
+  
+  result <- list()
+  
+  if (is.null(object$groups)) {
+    metrics <- get_metrics(object$fit$km_results)
+    result$metrics <- metrics
+  } else {
+    # For grouped analysis, calculate metrics for each group separately
+    metrics <- matrix(0, nrow = length(object$groups), ncol = 4)
+    rownames(metrics) <- object$groups
+    colnames(metrics) <- c("Median", "RMST", "Events", "Censored")
+    
+    for (i in seq_along(object$groups)) {
+      group <- object$groups[i]
+      group_data <- object$data[object$data[[object$group_col]] == group, ]
+      metrics[i,] <- get_metrics(
+        object$fit$km_results[[i]], 
+        group_data = group_data,
+        status_col = object$status_col
+      )
+    }
+    
+    result$metrics <- metrics
+    result$lr_test <- object$fit$lr_test
+    
+    # Add group-specific sample sizes and censoring rates
+    result$group_summary <- data.frame(
+      N = tapply(object$data[[object$status_col]], 
+                object$data[[object$group_col]], length),
+      Events = tapply(object$data[[object$status_col]], 
+                     object$data[[object$group_col]], sum)
+    )
+    result$group_summary$"Censoring %" <- round(
+      (result$group_summary$N - result$group_summary$Events) / 
+        result$group_summary$N * 100, 1
+    )
+  }
+  
+  structure(result, class = "summary.custom_survival")
+}
+
+#' S3 print method for summary.custom_survival objects
+#' @param x summary.custom_survival object
+#' @param ... Additional arguments
+#' @export
+print.summary.custom_survival <- function(x, ...) {
+  if (is.null(dim(x$metrics))) {
+    cat("\nSurvival Metrics:\n")
+    cat("Median survival time:",
+        round(x$metrics["median"], 1),
+        "months\n")
+    cat("Restricted mean survival time:",
+        round(x$metrics["rmst"], 1),
+        "months\n")
+    cat("Number of events:", x$metrics["events"], "\n")
+    cat("Number censored:", x$metrics["censored"], "\n")
+  } else {
+    cat("\nSurvival Metrics by Group:\n")
+    print(round(x$metrics, 2))
+    
+    if (!is.null(x$lr_test)) {
+      cat("\nLog-rank Test Results:\n")
+      cat("Chi-square statistic:",
+          round(x$lr_test$chi_square, 2),
+          "\n")
+      cat("Degrees of freedom:", x$lr_test$df, "\n")
+      cat("P-value:", format.pval(x$lr_test$p_value), "\n")
+      
+      cat("\nGroup Summary:\n")
+      print(x$group_summary)
+      
+      # Create numeric table first
+      numeric_data <- data.frame(
+        Observed = x$lr_test$observed,
+        Expected = x$lr_test$expected,
+        O_E = x$lr_test$observed - x$lr_test$expected
+      )
+      # Round numeric columns
+      numeric_data <- round(numeric_data, 2)
+      
+      # Add group names as row names instead of as a column
+      rownames(numeric_data) <- rownames(x$metrics)
+      
+      cat("\nObserved vs Expected Events:\n")
+      print(numeric_data)
+    }
+  }
+}
+
+#' S3 plot method for custom_survival objects with improved risk table
+#' @param x custom_survival object
+#' @param type Type of plot ("survival" or "hazard")
+#' @param conf.int Logical, whether to show confidence intervals
+#' @param risk.table Logical, whether to show risk table
+#' @param censor.marks Logical, whether to show censoring marks
+#' @param ... Additional arguments
+#' @export
+plot.custom_survival <- function(x,
+                                 ...,
+                                 type = "survival",
+                                 conf.int = TRUE,
+                                 risk.table = FALSE,
+                                 censor.marks = TRUE) {
+  old_par <- par(no.readonly = TRUE)
+  on.exit(par(old_par))
+  
+  # Set figure dimensions more suitable for PDF
+  if (risk.table) {
+    layout(matrix(c(1, 2), nrow = 2, ncol = 1), heights = c(3, 1))
+    par(mar = c(4, 4, 2, 2) + 0.1)
+  } else {
+    par(mar = c(4, 4, 2, 8) + 0.1)  # Increased right margin for legend
+  }
+  
+  if (type == "survival") {
+    plot_data <- if (is.null(x$groups))
+      list(x$fit$km_results)
+    else
+      x$fit$km_results
+    ylim <- c(0, 1)
+    ylab <- "Survival Probability"
+  } else if (type == "hazard") {
+    plot_data <- if (is.null(x$groups)) {
+      list(hazard_rate(x$data[[x$time_col]], x$data[[x$status_col]]))
+    } else {
+      lapply(x$groups, function(g) {
+        idx <- x$data[[x$group_col]] == g
+        hazard_rate(x$data[[x$time_col]][idx], x$data[[x$status_col]][idx])
+      })
+    }
+    ylim <- c(0, max(sapply(plot_data, function(x)
+      max(x$hazard))))
+    ylab <- "Hazard Rate"
+  }
+  
+  # Create main plot
+  colors <- rainbow(length(plot_data))
+  plot(
+    NULL,
+    xlim = range(x$data[[x$time_col]]),
+    ylim = ylim,
+    xlab = "Time (months)",
+    ylab = ylab
+  )
+  
+  for (i in seq_along(plot_data)) {
+    pd <- plot_data[[i]]
+    if (type == "survival") {
+      lines(stepfun(pd$time, c(1, pd$survival)), col = colors[i])
+      if (conf.int) {
+        lines(pd$time, pd$upper, col = colors[i], lty = 2)
+        lines(pd$time, pd$lower, col = colors[i], lty = 2)
+      }
+      if (censor.marks) {
+        points(pd$time[pd$n_censored > 0],
+               pd$survival[pd$n_censored > 0],
+               pch = "|",
+               col = colors[i])
+      }
+    } else {
+      lines(pd$time, pd$hazard, col = colors[i], type = "s")
+    }
+  }
+  
+  # Modified legend placement and size
+  if (!is.null(x$groups)) {
+    legend(
+      "topright",
+      legend = x$groups,
+      col = colors,
+      lty = 1,
+      cex = 0.7,
+      # Smaller text
+      inset = c(-0.2, 0),
+      # Move legend outside plot
+      xpd = TRUE
+    )  # Allow plotting outside figure region
+  }
+  
+  # Risk table with improved formatting
+  if (risk.table && type == "survival") {
+    par(mar = c(4, 4, 0, 2) + 0.1)
+    
+    plot(
+      NULL,
+      xlim = range(x$data[[x$time_col]]),
+      ylim = c(0.5, length(plot_data) + 0.5),
+      xlab = "Time (months)",
+      ylab = "Number at risk",
+      yaxt = "n"
+    )
+    
+    if (is.null(x$groups)) {
+      pd <- x$fit$km_results
+      axis(2,
+           at = 1,
+           labels = "Overall",
+           las = 1)
+      
+      time_breaks <- pretty(pd$time, n = 10)
+      time_breaks <- time_breaks[time_breaks <= max(pd$time)]
+      
+      for (t in time_breaks) {
+        idx <- which.min(abs(pd$time - t))
+        text(t, 1, pd$n_risk[idx], cex = 0.8)
+      }
+    } else {
+      axis(
+        2,
+        at = seq_along(x$groups),
+        labels = x$groups,
+        las = 1
+      )
+      
+      time_range <- range(x$data[[x$time_col]])
+      time_breaks <- pretty(time_range, n = 10)
+      time_breaks <- time_breaks[time_breaks <= time_range[2]]
+      
+      for (i in seq_along(x$groups)) {
+        pd <- x$fit$km_results[[i]]
+        for (t in time_breaks) {
+          idx <- which.min(abs(pd$time - t))
+          text(t, i, pd$n_risk[idx], cex = 0.8)
+        }
+      }
+    }
+    
+    abline(v = time_breaks,
+           lty = 3,
+           col = "gray")
+  }
+}
+
+#' Example usage for documentation:
+#' @examples
+#' # Create sample data (similar to actual data structure)
+#' data <- data.frame(
+#'   Overall_Survival_Months = c(10, 20, 30, 40, 50),
+#'   status = c(1, 0, 1, 0, 1),
+#'   Subtype = c("A", "A", "B", "B", "A")
+#' )
+#'
+#' # Basic analysis (without groups)
+#' fit <- custom_survival_analyzer(
+#'   data = data,
+#'   time_col = "Overall_Survival_Months",
+#'   status_col = "status"
+#' )
+#'
+#' # Basic usage
+#' print(fit)
+#' summary(fit)
+#'
+#' # Additional analyses
+#' hazard(fit)  # Calculate hazard rates
+#' rmst(fit)    # Calculate restricted mean survival time
+#'
+#' # Plotting
+#' plot(fit, type = "survival", conf.int = TRUE, risk.table = TRUE)
+#' plot(fit, type = "hazard")
+#'
+#' # Grouped analysis
+#' fit_grouped <- custom_survival_analyzer(
+#'   data = data,
+#'   time_col = "Overall_Survival_Months",
+#'   status_col = "status",
+#'   group_col = "Subtype"
+#' )
+#'
+#' # Group-specific analyses
+#' print(fit_grouped)
+#' summary(fit_grouped)
+#' hazard(fit_grouped)  # Group-specific hazard rates
+#' rmst(fit_grouped)    # Group-specific RMST
+#'
+#' # Group-specific plots
+#' plot(fit_grouped, type = "survival", conf.int = TRUE, risk.table = TRUE)
+#' plot(fit_grouped, type = "hazard")
+```
+
+```{r}
+# Actual usage demonstration:
+# Create basic survival analysis
+fit <- custom_survival_analyzer(data_survival,
+                                time_col = "Overall_Survival_Months",
+                                status_col = "status")
+
+# Basic usage
+cat("Printing Fit\n")
+print(fit)
+cat("\n\nPrinting Summary")
+summary(fit)
+
+```
+
+Primarily based on the Kaplan Meier estimator, the basic statistics like sample size, total follow up, events, and censoring are calculated with basic functions such as the direct count, total sum, and ratio for censuring rate.
+
+Survival metric Median survival was calculated by identifying the time point where the survival probability crosses 0.5, it represents the time when 50% of subjects are still event-free. Restricted mean survival time is computing the area under the Kaplan-Meier survival curve, using trapezoidal integration between time points, and represents the average survival time during the study period.
+
+The high censoring rate and relatively long median survival time suggest good survival outcomes for the population. The similarity between median survival and RMST indicates a fairly symmetric survival distribution.
+
+```{r}
+
+# Additional analyses
+cat("Hazard Printing\n")
+print(hazard(fit))
+
+```
+
+Hazard rates are calculated as events per person-time. Values represent instantaneous risk of event at each time point, the increasing pattern suggests time-dependent risk, and the maximum hazard of 0.25 means at peak risk, there's a 25% instantaneous probability of event per unit time.
+
+Show an increasing hazard over time, starting very low and rising substantially. Early hazard is very low, there is a dramatic increase in later periods, especially after 50 months. Highest hazard at the end of the follow up. The 74.4% censoring rate we saw earlier explains the low early hazard rates. The increase in later hazard makes sense given the median survival time.
+
+```{r}
+
+cat("Printing rmst fit:\n")
+print(rmst(fit))
+```
+
+A more specific value to look at, visible in the summary of the survival model.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+# Create plots
+plot(fit,
+     type = "survival",
+     conf.int = TRUE,
+     risk.table = TRUE)
+plot(fit, type = "hazard")
+
+
+```
+
+```{r}
+
+# Grouped analysis
+fit_grouped <- custom_survival_analyzer(
+  data_survival,
+  time_col = "Overall_Survival_Months",
+  status_col = "status",
+  group_col = "Subtype"
+)
+# Group-specific analyses
+print(fit_grouped)
+summary(fit_grouped)
+
+```
+
+We actually have the survival pattern that is expected, which we were a bit unsure of previously. The IDHmut-codel has the expected best survival, the IDHmut-non-codel is the intermediate risk subtype, and the IDHwt which has lowest survival rate. This matches the biological behavior that is expected. The O-E calculations align with observed patterns.
+
+```{r}
+
+hazard(fit_grouped)
+
+```
+
+Hazard model by sub type matches expectations of the disease.
+
+```{r}
+
+rmst(fit_grouped)
+```
+
+Further confirmation of our expected sub type distributions.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 8
+
+
+# Group-specific plots
+plot(
+  fit_grouped,
+  type = "survival",
+  conf.int = TRUE,
+  risk.table = TRUE
+)
+plot(fit_grouped, type = "hazard")
+
+```
